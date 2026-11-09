@@ -1,0 +1,4 @@
+[
+  {"pattern": "^Tarea \\d+", "course": "Mi Materia 1"},
+  {"pattern": "^Examen|^Práctica", "course": "Mi Materia 2"}
+]
