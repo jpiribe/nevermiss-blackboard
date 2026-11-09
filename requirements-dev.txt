@@ -1,4 +1,5 @@
-pytest
-ruff
-mypy
-types-requests
+# Herramientas de desarrollo con versión exacta; Dependabot propone las actualizaciones.
+mypy==2.4.1
+pytest==9.2.0
+ruff==0.17.4
+types-requests==2.33.0.20261030
