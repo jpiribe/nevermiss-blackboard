@@ -10,10 +10,13 @@ import json
 import logging
 import os
 import re
+import signal
 import smtplib
 import ssl
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from email.message import EmailMessage
@@ -50,6 +53,12 @@ PRUNE_AFTER_DAYS = 30       # se olvidan entradas del state vencidas hace más d
 FAILURE_ALERT_AFTER = timedelta(hours=24)
 DOWNLOAD_BUDGET_S = 60        # plazo total de la descarga (frente a servidores lentos)
 EXTRACT_BUDGET_S = 60         # plazo total para expandir el calendario
+UID_BUDGET_S = 5              # plazo duro para expandir un solo UID
+MAX_RRULES_PER_UID = 2
+MAX_RDATES_PER_UID = 100
+MAX_TIMEZONES = 50
+MAX_LINK_CHARS = 500
+MAX_UID_CHARS = 200
 MAX_OCCURRENCES_PER_UID = 200   # tope por serie: un RRULE hostil no debe inundar correo ni state
 MAX_TASKS = 2000            # tope total de tareas por ejecución
 SUBDAILY_FREQS = {"SECONDLY", "MINUTELY", "HOURLY"}
@@ -97,6 +106,27 @@ def fetch_ics(url: str) -> str:
     raise error
 
 
+@contextmanager
+def _hard_deadline(seconds: float):
+    """Corta con TimeoutError lo que tarde más de `seconds` (también un bloqueo en C o en
+    una lectura de red). Solo en el hilo principal de Linux/macOS; si no, no hace nada."""
+    en_principal = threading.current_thread() is threading.main_thread()
+    if not hasattr(signal, "setitimer") or not en_principal:
+        yield
+        return
+
+    def _expired(*_):
+        raise TimeoutError
+
+    old = signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def _download(url: str, host: str) -> str:
     deadline = time.monotonic() + DOWNLOAD_BUDGET_S
     for _ in range(MAX_REDIRECTS + 1):
@@ -122,12 +152,14 @@ def _download(url: str, host: str) -> str:
             if r.status_code >= 400:
                 raise FeedError(f"descarga fallida (HTTP {r.status_code}; ¿el enlace expiró?)")
             data = bytearray()
-            for chunk in r.iter_content(64 * 1024):
-                data += chunk
-                if time.monotonic() > deadline:
-                    raise _Transient("descarga demasiado lenta")
-                if len(data) > MAX_ICS_BYTES:
-                    raise FeedError("respuesta demasiado grande para ser un feed .ics")
+            try:
+                with _hard_deadline(max(1.0, deadline - time.monotonic())):
+                    for chunk in r.iter_content(64 * 1024):
+                        data += chunk
+                        if len(data) > MAX_ICS_BYTES:
+                            raise FeedError("respuesta demasiado grande para ser un feed .ics")
+            except TimeoutError:
+                raise _Transient("descarga demasiado lenta") from None
             # Sin depender del charset del servidor (r.text asume ISO-8859-1).
             return data.decode("utf-8-sig", "replace")
     raise FeedError("demasiadas redirecciones")
@@ -185,7 +217,9 @@ def _find_link(comp) -> str:
     if not url:
         m = re.search(r"https?://\S+", _text(comp, "DESCRIPTION"))
         url = m.group(0).rstrip(").,>") if m else ""
-    return url if urlsplit(url).scheme == "https" else ""   # nada de javascript:, data:, etc.
+    if len(url) > MAX_LINK_CHARS or urlsplit(url).scheme != "https":
+        return ""   # nada de javascript:, data: ni enlaces kilométricos
+    return _oneline(url)
 
 
 def _to_local(dt):
@@ -222,7 +256,9 @@ def extract_tasks(cal, now: datetime) -> dict:
         # Cada UID (serie + excepciones) se expande y procesa por separado:
         # un evento malformado no debe dejar sin recordatorios al resto.
         try:
-            for n, comp in enumerate(recurring_ical_events.of(group).between(start, end)):
+            with _hard_deadline(UID_BUDGET_S):
+                occurrences = recurring_ical_events.of(group).between(start, end)
+            for n, comp in enumerate(occurrences):
                 if n >= MAX_OCCURRENCES_PER_UID or len(tasks) >= MAX_TASKS:
                     log.warning("serie truncada: demasiadas ocurrencias")
                     break
@@ -240,7 +276,14 @@ def _is_subdaily(comps) -> bool:
     múltiples, puede colgar la ejecución). Tolera RRULE repetido (icalendar da lista)."""
     for c in comps:
         rules = c.get("RRULE")
-        for rule in rules if isinstance(rules, list) else [rules]:
+        rules = rules if isinstance(rules, list) else [rules]
+        if sum(r is not None for r in rules) > MAX_RRULES_PER_UID:
+            return True
+        rdates = c.get("RDATE")
+        rdates = rdates if isinstance(rdates, list) else [rdates]
+        if sum(len(getattr(r, "dts", [])) for r in rdates if r is not None) > MAX_RDATES_PER_UID:
+            return True
+        for rule in rules:
             if rule is None:
                 continue
             if any(str(f).upper() in SUBDAILY_FREQS for f in rule.get("FREQ", [])):
@@ -250,33 +293,31 @@ def _is_subdaily(comps) -> bool:
     return False
 
 
-def _by_uid(cal, events) -> list:
-    """Un VCALENDAR por UID, con las propiedades y zonas horarias del original."""
+def _by_uid(cal, events):
+    """Un VCALENDAR por UID (generador), con las propiedades y zonas del original."""
     groups: dict[str, list] = {}
     for c in events:
         groups.setdefault(str(c.get("UID", "")), []).append(c)
-    timezones = list(cal.walk("VTIMEZONE"))
-    out = []
+    timezones = list(cal.walk("VTIMEZONE"))[:MAX_TIMEZONES]
     for comps in groups.values():
         try:
             subdaily = _is_subdaily(comps)
         except Exception:  # noqa: BLE001 - un RRULE raro no debe tumbar todo el feed
             subdaily = True
         if subdaily:
-            log.warning("serie omitida: se repite varias veces al día o es ilegible")
+            log.warning("serie omitida: demasiadas repeticiones o ilegible")
             continue
         sub = icalendar.Calendar()
         for k, v in cal.items():
             sub[k] = v
         for c in timezones + comps:
             sub.add_component(c)
-        out.append(sub)
-    return out
+        yield sub
 
 
 def _task_from(comp, now: datetime, recurring_uids: set, rules: list) -> dict | None:
     """Tarea a partir de una ocurrencia, o None si no es una entrega vigente."""
-    uid = str(comp.get("UID", "")).strip()
+    uid = str(comp.get("UID", "")).strip()[:MAX_UID_CHARS]
     if not uid or "DTSTART" not in comp:
         return None
     if str(comp.get("STATUS", "")).upper() == "CANCELLED":

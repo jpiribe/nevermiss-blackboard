@@ -16,3 +16,6 @@ reminder.log
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Calendarios locales
+/*.ics

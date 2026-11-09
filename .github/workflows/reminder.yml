@@ -23,6 +23,8 @@ jobs:
     steps:
       # Acciones fijadas por SHA (el tag puede moverse); Dependabot las actualiza.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false   # el token no queda en .git/config durante pip ni reminder.py
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
@@ -53,7 +55,12 @@ jobs:
 
       - name: Guardar state.json
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # El token se usa solo aquí, por cabecera, sin escribirlo en la config de git.
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -62,7 +69,8 @@ jobs:
             # Reintentos acotados. Ante conflicto en state.json gana el de esta
             # ejecución (-X theirs en un rebase = el commit local), que es el más reciente.
             for i in 1 2 3; do
-              if git pull --rebase -q -X theirs && git push -q; then exit 0; fi
+              if git -c "http.extraheader=$AUTH" pull --rebase -q -X theirs \
+                 && git -c "http.extraheader=$AUTH" push -q; then exit 0; fi
               git rebase --abort 2>/dev/null || true
               sleep $((i * 5))
             done

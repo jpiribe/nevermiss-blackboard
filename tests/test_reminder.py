@@ -360,3 +360,52 @@ def test_redireccion_invalida_es_error_controlado(monkeypatch, destino):
     monkeypatch.setattr(reminder.requests, "get", lambda *a, **k: Resp())
     with pytest.raises(reminder.FeedError):
         reminder._download("https://host/feed.ics", "host")
+
+
+def test_muchas_rrule_con_dtstart_antiguo_no_cuelgan(run, smtp):
+    import time
+    run(ics(tarea("base", "base", dtstart="20261201T065900Z")), "2026-10-29T10:00")
+    rrules = "\r\n".join(f"RRULE:FREQ=DAILY;BYHOUR={h};BYMINUTE=0" for h in range(24))
+    feed = _feed_con_serie(rrules).replace("DTSTART:20261101T065900Z", "DTSTART:00010101T000000Z")
+    t0 = time.monotonic()
+    assert run(feed, "2026-10-29T11:00") == 0
+    assert time.monotonic() - t0 < 10
+    assert smtp.sent == []
+
+
+def test_rdate_masivo_se_descarta(run, smtp):
+    run(ics(tarea("base", "base", dtstart="20261201T065900Z")), "2026-10-29T10:00")
+    fechas = ",".join(f"20261101T{h:02d}{m:02d}00Z" for h in range(24) for m in range(0, 60, 15))
+    feed = _feed_con_serie("RDATE:" + fechas + "\r\n" + "\r\n".join(
+        f"RDATE:2026110{d}T120000Z,2026110{d}T130000Z" for d in range(1, 10)) * 8)
+    assert run(feed, "2026-10-29T11:00") == 0
+    assert len(smtp.sent) <= 2
+
+
+def test_enlace_kilometrico_no_va_al_correo(run, smtp):
+    run(ics(tarea("base", "base", dtstart="20261201T065900Z")), "2026-10-29T10:00")
+    feed = ics(tarea("base", "base", dtstart="20261201T065900Z"),
+               tarea("a", "A", extra="URL:https://x.test/" + "a" * 5000))
+    run(feed, "2026-10-29T11:00")
+    (msg,) = smtp.sent
+    assert "Enlace:" not in msg.get_content()
+
+
+def test_descarga_con_goteo_se_corta_por_plazo(monkeypatch):
+    import time
+
+    class Resp:
+        is_redirect, status_code = False, 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_content(self, n):
+            while True:
+                time.sleep(0.2)
+                yield b"x"
+
+    monkeypatch.setattr(reminder.requests, "get", lambda *a, **k: Resp())
+    monkeypatch.setattr(reminder, "DOWNLOAD_BUDGET_S", 1)
+    t0 = time.monotonic()
+    with pytest.raises(reminder._Transient):
+        reminder._download("https://host/feed.ics", "host")
+    assert time.monotonic() - t0 < 5
