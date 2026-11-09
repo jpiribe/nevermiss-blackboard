@@ -1,0 +1,71 @@
+name: Blackboard reminder
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # cada hora (minuto 7, evita la congestión de :00)
+  workflow_dispatch:
+
+# Evita ejecuciones solapadas que pisarían state.json
+concurrency:
+  group: blackboard-reminder
+  cancel-in-progress: false
+
+permissions: {}     # nada por defecto; el job pide solo lo que necesita
+
+jobs:
+  run:
+    # El repo plantilla no tiene secrets: solo corre en las copias de cada quien.
+    if: github.repository != 'jpiribe/nevermiss-blackboard'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # necesario para commitear state.json
+    steps:
+      # Acciones fijadas por SHA (el tag puede moverse); Dependabot las actualiza.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # state.json guarda los títulos de tus tareas: no se ejecuta en un repo público.
+      - name: Exigir repositorio privado
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
+          if [ "$private" != "true" ]; then
+            echo "::error::Este repositorio es público: hazlo privado (Settings → Danger Zone)."
+            exit 1
+          fi
+
+      - run: pip install -r requirements.txt
+
+      - name: Ejecutar recordatorios
+        env:
+          BLACKBOARD_ICS_URL: ${{ secrets.BLACKBOARD_ICS_URL }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
+          REMIND_HOUR: ${{ vars.REMIND_HOUR }}
+        run: python reminder.py
+
+      - name: Guardar state.json
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: actualizar state.json"
+            # Reintentos acotados. Ante conflicto en state.json gana el de esta
+            # ejecución (-X theirs en un rebase = el commit local), que es el más reciente.
+            for i in 1 2 3; do
+              if git pull --rebase -q -X theirs && git push -q; then exit 0; fi
+              git rebase --abort 2>/dev/null || true
+              sleep $((i * 5))
+            done
+            echo "::error::no se pudo subir state.json tras 3 intentos"
+            exit 1
+          fi
