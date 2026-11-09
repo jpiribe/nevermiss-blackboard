@@ -1,0 +1,14 @@
+# Versiones exactas (incluidas las transitivas). Dependabot propone las actualizaciones.
+# Directas: icalendar, recurring-ical-events, requests, tzdata.
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.1
+icalendar==7.3.0
+idna==3.20
+python-dateutil==2.9.0.post0
+recurring-ical-events==3.8.2
+requests==2.34.2
+six==1.17.0
+tzdata==2026.6
+urllib3==2.8.0
+x-wr-timezone==2.0.1

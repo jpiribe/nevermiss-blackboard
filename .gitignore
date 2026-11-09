@@ -1,0 +1,18 @@
+# Secretos
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Salidas locales de pruebas
+tests/_state_test.json
+reminder.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
